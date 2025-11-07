@@ -4,6 +4,7 @@ use headless_chrome::{Browser, LaunchOptions};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 use std::{collections::HashMap, str::FromStr};
 use tokio::{fs, task};
 use tracing::{debug, info, warn};
@@ -15,6 +16,8 @@ const DEFAULT_USER_AGENT: &str =
 const CF_CLEARANCE_NAME: &str = "cf_clearance"; // 只提取特定cookie，避免全量
 const IP_PLACEHOLDER: &str = "12704efe9702be1480f07823cef5222b"; // IP MD5
 const COOKIE_EXPIRE_DAYS: i64 = 30;
+const TIMEOUT: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Deserialize, Serialize)]
 struct JsonResult {
@@ -36,11 +39,18 @@ impl OktiXyz {
         let base_url = format!("https://{}", TARGET_URL);
         // 阻塞线程执行Chrome操作
         let cf_cookie = task::spawn_blocking(move || -> anyhow::Result<String> {
-            let options = LaunchOptions::default_builder()
-                .headless(true)
-                .sandbox(false)
-                .build()
-                .context("Failed to build Chrome options")?;
+            // 构建共享的 LaunchOptions builder
+            let mut builder = LaunchOptions::default_builder(); // owned LaunchOptionsBuilder
+            builder.headless(true); // &mut self -> &mut Self，变异就地
+            builder.sandbox(false); // 禁用沙箱，适合服务器
+            builder.enable_gpu(false);
+
+            #[cfg(target_os = "linux")]
+            {
+                builder.path(Some("/usr/bin/chromium".into()));
+            }
+
+            let options = builder.build().context("Failed to build Chrome options")?;
 
             let browser = Browser::new(options).context("Failed to launch Chrome browser")?;
             let tab = browser.new_tab().context("Failed to create tab")?;
@@ -48,27 +58,24 @@ impl OktiXyz {
             tab.navigate_to(&base_url)
                 .context("Failed to navigate to URL")?;
             tab.wait_until_navigated()?;
-            std::thread::sleep(std::time::Duration::from_secs(2)); // 短轮询，减少总等待
-            if tab
-                .get_title()
-                .unwrap_or_default()
-                .contains("Checking your browser")
-            {
-                std::thread::sleep(std::time::Duration::from_millis(500)); // 短轮询，减少总等待
+            // 轮询等待 cf_clearance（带超时）
+            let start = Instant::now();
+            let mut clearance_cookie: Option<String> = None;
+            while start.elapsed() < TIMEOUT {
+                let cookies = tab.get_cookies().context("Failed to get cookies")?;
+                if let Some(cookie) = cookies.into_iter().find(|c| c.name == CF_CLEARANCE_NAME) {
+                    clearance_cookie = Some(format!("{}={}", cookie.name, cookie.value));
+                    break;
+                }
+                std::thread::sleep(POLL_INTERVAL); // 轮询间隔
             }
 
-            // 提取特定cf_clearance cookie
-            let cookies = tab.get_cookies().context("Failed to get cookies")?;
-            let cf_clearance_opt = cookies
-                .into_iter()
-                .find(|c| c.name == CF_CLEARANCE_NAME)
-                .map(|c| format!("{}={}", c.name, c.value));
-
-            if let Some(cf) = cf_clearance_opt {
+            if let Some(cf) = clearance_cookie {
                 // 如果需要添加ip/expire，动态计算
                 let now: DateTime<Utc> = Utc::now();
                 let expire = now + chrono::Duration::days(COOKIE_EXPIRE_DAYS);
-                let mut parts = vec![cf];
+                let mut parts = Vec::with_capacity(3);
+                parts.push(cf.clone());
                 parts.push(format!("ip={}", IP_PLACEHOLDER));
                 parts.push(format!("expire_in={}", expire.timestamp()));
                 Ok(parts.join("; "))
