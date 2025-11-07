@@ -1,2 +1,4 @@
 /target
 cookie.txt
+.env
+example.env
